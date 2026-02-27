@@ -1,55 +1,72 @@
 """
-Automaton Auditor — LangGraph StateGraph (Interim Submission).
+Automaton Auditor — LangGraph StateGraph (Final Submission).
 
-Graph topology (interim)
-------------------------
+Graph topology (final)
+----------------------
 
     START
-      ├──────────────────────────────────────────────────────┐
-      │                                                      │
-      ▼                                                      ▼
-  repo_investigator                                   doc_analyst
-  (RepoInvestigator)                               (DocAnalyst)
-      │  evidences["git_forensic_analysis"]             │  evidences["theoretical_depth"]
-      │  evidences["state_management_rigor"]            │  evidences["report_accuracy"]
-      │  evidences["graph_orchestration"]               │    (cross-ref deferred →)
-      │  evidences["safe_tool_engineering"]             │
-      │  evidences["structured_output_enforcement"]     │
-      │                                                  │
-      └──────────────────────┬───────────────────────────┘
-                             │  operator.ior merges both branches
-                             ▼
-                   evidence_aggregator  ← Fan-In synchronisation node
-                   - verifies all required criteria keys are present
-                   - runs secondary report_accuracy cross-reference
-                   - logs completeness summary
-                             │
-                             ▼
-                      interim_end_node  ← Placeholder for Judicial Layer
-                      (Prosecutor / Defense / TechLead added in final submission)
-                             │
-                             ▼
-                            END
+      ├────────────────────────────────────────────┐
+      │                                            │
+      ▼                                            ▼
+  repo_investigator                           doc_analyst
+  (RepoInvestigator)                          (DocAnalyst)
+      │  evidences["git_forensic_analysis"]        │  evidences["theoretical_depth"]
+      │  evidences["state_management_rigor"]        │  evidences["report_accuracy"]
+      │  evidences["graph_orchestration"]           │
+      │  evidences["safe_tool_engineering"]         │
+      │  evidences["structured_output_enforcement"] │
+      │                                            │
+      └──────────────────┬─────────────────────────┘
+                         │  operator.ior merges both branches
+                         ▼
+               evidence_aggregator  ← Detective Fan-In
+               - completeness check
+               - secondary report_accuracy cross-reference
+               - conditional route: no evidence → END (graceful abort)
+                         │
+           ┌─────────────┼─────────────┐
+           │             │             │
+           ▼             ▼             ▼
+       prosecutor     defense       tech_lead
+           │             │             │
+           └─────────────┼─────────────┘
+                         │  operator.add concatenates all three opinion lists
+                         ▼
+               judicial_aggregator  ← Judicial Fan-In
+               - verifies all three judges submitted opinions
+               - logs judicial phase summary
+                         │
+                         ▼
+                  chief_justice  ← Deterministic synthesis
+                  - 5 named conflict-resolution rules
+                  - writes audit/<repo>_<timestamp>.md
+                         │
+                         ▼
+                        END
 
 State reducers — why parallel branches are safe
 -----------------------------------------------
-``AgentState.evidences`` is annotated with ``operator.ior`` (dict merge).
-When both detective branches complete, LangGraph applies:
+``AgentState.evidences`` — ``operator.ior`` (dict merge)
+    Detective branches write to disjoint criterion keys → non-destructive.
 
-    state["evidences"] |= repo_investigator_output["evidences"]
-    state["evidences"] |= doc_analyst_output["evidences"]
+``AgentState.opinions`` — ``operator.add`` (list concat)
+    Judge branches each append their opinions list → all opinions preserved.
 
-Each branch writes to *disjoint* criterion keys, so the merge is
-non-destructive.  If the same key were written by two branches the
-later branch's list would win — which is why the cross-reference update
-in ``evidence_aggregator`` reads the existing list from state first.
+Conditional routing
+-------------------
+``evidence_aggregator`` routes via ``_route_after_evidence()``:
+  • Empty/failed evidence → ``END`` (graceful abort with log)
+  • Valid evidence present → fan-out to ["prosecutor", "defense", "tech_lead"]
+
+LangGraph executes all three judge nodes concurrently.  The judicial_aggregator
+fan-in fires only after all three branches have completed and their state updates
+have been reduced by ``operator.add``.
 
 LangSmith tracing
 -----------------
 Automatic when ``LANGCHAIN_TRACING_V2=true`` is set in the environment.
-``build_graph()`` attaches a default ``run_name`` via ``.with_config()``,
-which LangSmith uses as the trace title.  Override per-invocation by
-passing ``config={"run_name": "my-custom-name"}`` to ``graph.invoke()``.
+``build_graph()`` attaches ``run_name``, ``tags``, and ``metadata`` via
+``.with_config()`` so every trace is identifiable in LangSmith.
 """
 
 from __future__ import annotations
@@ -64,13 +81,15 @@ from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
 
 from src.nodes.detectives import doc_analyst_node, repo_investigator_node
-from src.state import AgentState, Evidence
+from src.nodes.judges import defense_node, prosecutor_node, tech_lead_node
+from src.nodes.justice import chief_justice_node
+from src.state import AgentState, Evidence, JudicialOpinion
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Constants — criteria expected after the detective fan-in
+# Constants — criteria sets and judge roster
 # ---------------------------------------------------------------------------
 
 #: Rubric criteria covered by RepoInvestigator
@@ -92,8 +111,14 @@ _PDF_CRITERIA: frozenset[str] = frozenset(
     }
 )
 
-#: All criteria expected after the parallel detective phase
+#: All detective-phase criteria (used for completeness check)
 REQUIRED_INTERIM_CRITERIA: frozenset[str] = _REPO_CRITERIA | _PDF_CRITERIA
+
+#: Full rubric (detective + judicial coverage)
+REQUIRED_ALL_CRITERIA: frozenset[str] = REQUIRED_INTERIM_CRITERIA
+
+#: Judge personas expected in state["opinions"] after the judicial phase
+_EXPECTED_JUDGES: frozenset[str] = frozenset({"Prosecutor", "Defense", "TechLead"})
 
 # ---------------------------------------------------------------------------
 # Utility: load rubric dimensions from rubric.json
@@ -113,31 +138,27 @@ def _load_rubric_dimensions() -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Node: EvidenceAggregator (Fan-In synchronisation)
+# Node: EvidenceAggregator (Detective Fan-In)
 # ---------------------------------------------------------------------------
 
 
 def evidence_aggregator_node(state: AgentState) -> dict[str, Any]:
-    """Fan-in synchronisation node — runs after both detective branches complete.
+    """Detective fan-in node — runs after both detective branches complete.
 
     Responsibilities
     ----------------
-    1. **Completeness check** — verify every required criterion has at least
-       one Evidence entry; log warnings for any gaps.
-
-    2. **Secondary cross-reference** — use file-path locations from the
-       repo evidence to finalise the ``report_accuracy`` cross-reference
-       that DocAnalyst could not complete during parallel execution.
-
-    3. **Summary logging** — emit a concise audit summary so the LangSmith
-       trace shows progress without opening every Evidence blob.
+    1. **Completeness check** — log warnings for any missing criteria.
+    2. **Secondary cross-reference** — use repo file locations from
+       RepoInvestigator to finalise the report_accuracy analysis that
+       DocAnalyst deferred during parallel execution.
+    3. **Summary logging** — emit concise audit progress to LangSmith.
 
     Returns
     -------
     dict
-        Partial state update.  Returns ``{}`` if everything is present, or
-        updates ``evidences["report_accuracy"]`` with the cross-reference
-        result if repo location data is available.
+        ``{}`` when no cross-reference update is needed, or
+        ``{"evidences": {"report_accuracy": [...]}}`` with the cross-reference
+        result appended.
     """
     evidences: dict[str, list[Evidence]] = state.get("evidences", {})  # type: ignore[call-overload]
 
@@ -152,22 +173,20 @@ def evidence_aggregator_node(state: AgentState) -> dict[str, Any]:
         )
     else:
         logger.info(
-            "[EvidenceAggregator] All %d criteria present. Detective phase complete.",
+            "[EvidenceAggregator] All %d detective criteria present.",
             len(REQUIRED_INTERIM_CRITERIA),
         )
 
     # ── 2. Summary statistics ─────────────────────────────────────────────
     total = sum(len(v) for v in evidences.values())
     found = sum(1 for evs in evidences.values() for e in evs if e.found)
-    not_found = total - found
-
     logger.info(
         "[EvidenceAggregator] Evidence summary — "
         "criteria: %d, total items: %d, found: %d, not_found: %d",
         len(present),
         total,
         found,
-        not_found,
+        total - found,
     )
 
     # ── 3. Secondary cross-reference for report_accuracy ─────────────────
@@ -175,26 +194,17 @@ def evidence_aggregator_node(state: AgentState) -> dict[str, Any]:
     if xref_update:
         return {"evidences": xref_update}
 
-    # No state mutation needed when cross-reference is unavailable
     return {}
 
 
 def _cross_reference_report_accuracy(
     state: AgentState,
 ) -> dict[str, list[Evidence]] | None:
-    """Attempt to complete the report_accuracy cross-reference.
+    """Finalise the report_accuracy cross-reference using repo file locations.
 
-    Extracts repo file locations from the repo Evidence entries, then
-    compares them against the paths extracted by DocAnalyst.  If the
-    repo Evidence locations are not informative (e.g. clone failed),
-    returns ``None`` so no state update is made.
-
-    Approach
-    --------
-    Collects the ``location`` field from every repo Evidence item.
-    These are file paths like ``"src/state.py"`` or path ranges like
-    ``"src/graph.py:42-68"``.  Strip line-range suffixes and use the
-    clean paths as the "verified repo file" list.
+    DocAnalyst extracted path claims during parallel execution but could not
+    verify them (the repo file list wasn't available yet).  Now that both
+    branches have merged, we can perform the cross-reference.
     """
     evidences: dict[str, list[Evidence]] = state.get("evidences", {})  # type: ignore[call-overload]
 
@@ -203,17 +213,14 @@ def _cross_reference_report_accuracy(
     for criterion_id in _REPO_CRITERIA:
         for ev in evidences.get(criterion_id, []):
             loc = ev.location
-            # Strip "path:line_range" suffix if present
             clean = loc.split(":")[0].strip()
-            # Only keep plausible file paths (not URLs, not "(not found)")
             if "/" in clean and not clean.startswith("http") and "." in clean.split("/")[-1]:
                 repo_locations.add(clean)
 
     if not repo_locations:
-        # Repo clone may have failed — cannot do cross-reference
-        return None
+        return None  # Repo clone failed — cannot cross-reference
 
-    # Collect the claimed paths that DocAnalyst extracted
+    # Collect the claimed paths DocAnalyst extracted
     claimed_paths: list[str] = []
     for ev in evidences.get("report_accuracy", []):
         if ev.content:
@@ -223,7 +230,7 @@ def _cross_reference_report_accuracy(
                     claimed_paths.append(line.replace("claimed:", "").strip())
 
     if not claimed_paths:
-        return None  # Nothing to cross-reference
+        return None
 
     # Perform the cross-reference
     repo_norm = {p.replace("\\", "/").lstrip("./") for p in repo_locations}
@@ -259,40 +266,95 @@ def _cross_reference_report_accuracy(
         criterion_id="report_accuracy",
     )
 
-    # Read existing list and append — operator.ior will update the key
     existing = list(evidences.get("report_accuracy", []))
     return {"report_accuracy": existing + [xref_evidence]}
 
 
 # ---------------------------------------------------------------------------
-# Node: InterimEnd (placeholder — replaced by Judicial Layer in final)
+# Conditional routing — evidence_aggregator → judges OR END
 # ---------------------------------------------------------------------------
 
 
-def interim_end_node(state: AgentState) -> dict[str, Any]:
-    """Placeholder terminal node for the interim submission.
+def _route_after_evidence(state: AgentState) -> str | list[str]:
+    """Routing function for the conditional edge out of evidence_aggregator.
 
-    In the final submission this node is replaced by:
-      - Parallel judge fan-out: Prosecutor, Defense, TechLead
-      - ChiefJusticeNode (deterministic conflict resolution)
-      - AuditReport serialisation to Markdown
+    Returns
+    -------
+    str | list[str]
+        ``END`` (``"__end__"``) when no valid evidence was collected,
+        triggering a graceful graph termination before the judicial phase.
 
-    For now it logs the detective-phase summary and exits gracefully.
+        A list of three judge node names when evidence is present,
+        which LangGraph interprets as a parallel fan-out to all three
+        nodes simultaneously.
     """
     evidences: dict[str, list[Evidence]] = state.get("evidences", {})  # type: ignore[call-overload]
 
-    total = sum(len(v) for v in evidences.values())
-    found = sum(1 for evs in evidences.values() for e in evs if e.found)
+    has_any_evidence = any(bool(ev_list) for ev_list in evidences.values())
+
+    if not has_any_evidence:
+        logger.warning(
+            "[Graph] No evidence collected by any detective — "
+            "aborting gracefully before judicial phase."
+        )
+        return END
+
+    # Fan-out: LangGraph runs all three judge nodes concurrently
+    logger.info("[Graph] Evidence confirmed. Routing to judicial fan-out.")
+    return ["prosecutor", "defense", "tech_lead"]
+
+
+# ---------------------------------------------------------------------------
+# Node: JudicialAggregator (Judicial Fan-In)
+# ---------------------------------------------------------------------------
+
+
+def judicial_aggregator_node(state: AgentState) -> dict[str, Any]:
+    """Judicial fan-in node — runs after all three judge branches complete.
+
+    operator.add has already concatenated all opinions into state["opinions"]
+    by the time this node executes.  This node verifies coverage and logs a
+    summary before routing to the ChiefJustice.
+
+    Returns
+    -------
+    dict
+        ``{}`` — no state mutation required; verification is log-only.
+    """
+    opinions: list[JudicialOpinion] = state.get("opinions", [])  # type: ignore[call-overload]
+
+    # Group by criterion to check judge coverage
+    coverage: dict[str, set[str]] = {}
+    for op in opinions:
+        coverage.setdefault(op.criterion_id, set()).add(op.judge)
+
+    fully_covered = sum(
+        1 for judges in coverage.values() if judges >= _EXPECTED_JUDGES
+    )
+    partially_covered = len(coverage) - fully_covered
+    missing_judges_report = {
+        cid: sorted(_EXPECTED_JUDGES - judges)
+        for cid, judges in coverage.items()
+        if judges < _EXPECTED_JUDGES
+    }
+
+    if missing_judges_report:
+        logger.warning(
+            "[JudicialAggregator] Incomplete coverage — criteria missing judges: %s",
+            missing_judges_report,
+        )
+    else:
+        logger.info(
+            "[JudicialAggregator] All %d criteria have full 3-judge coverage.",
+            fully_covered,
+        )
 
     logger.info(
-        "[InterimEnd] Detective phase complete — "
-        "%d criteria, %d evidence items (%d found / %d not found). "
-        "⚠ INTERIM SUBMISSION: Judicial Layer (Prosecutor → Defense → TechLead "
-        "→ ChiefJustice) pending for final submission.",
-        len(evidences),
-        total,
-        found,
-        total - found,
+        "[JudicialAggregator] Judicial phase complete — "
+        "%d total opinions | %d criteria fully covered | %d partially covered",
+        len(opinions),
+        fully_covered,
+        partially_covered,
     )
     return {}
 
@@ -303,64 +365,70 @@ def interim_end_node(state: AgentState) -> dict[str, Any]:
 
 
 def build_graph() -> Any:
-    """Construct and compile the Automaton Auditor StateGraph.
+    """Construct and compile the full Automaton Auditor StateGraph.
 
-    Graph structure (interim)
-    -------------------------
+    Graph structure (final submission)
+    ------------------------------------
 
-        START → [repo_investigator ‖ doc_analyst]
-              → evidence_aggregator
-              → interim_end
+        START → [repo_investigator ‖ doc_analyst]          (detective fan-out)
+              → evidence_aggregator                         (detective fan-in)
+              → conditional: empty evidence → END           (graceful abort)
+              → [prosecutor ‖ defense ‖ tech_lead]          (judicial fan-out)
+              → judicial_aggregator                         (judicial fan-in)
+              → chief_justice                               (deterministic synthesis)
               → END
 
-    The fan-out is expressed as two separate edges from START.  LangGraph
-    runs both destination nodes concurrently.  The fan-in at
-    ``evidence_aggregator`` is implicit: the node executes only after
-    *both* upstream branches have finished and their state updates have
-    been merged by the ``operator.ior`` reducer.
-
-    LangSmith tracing
-    -----------------
-    ``.with_config()`` attaches a default run name so every trace in
-    LangSmith is labeled "automaton-auditor" rather than an opaque UUID.
-    This can be overridden per-invocation.
+    Two distinct parallel fan-out / fan-in patterns satisfy the rubric's
+    graph_orchestration criterion:
+      • Detective fan-out/fan-in (START → detectives → evidence_aggregator)
+      • Judicial fan-out/fan-in  (evidence_aggregator → judges → judicial_aggregator)
 
     Returns
     -------
-    Compiled ``StateGraph`` (``CompiledStateGraph``) pre-configured with
-    LangSmith metadata via ``.with_config()``.
+    CompiledStateGraph
+        Pre-configured with LangSmith metadata via ``.with_config()``.
     """
     builder: StateGraph = StateGraph(AgentState)
 
-    # ── Register nodes ────────────────────────────────────────────────────
+    # ── Register all nodes ────────────────────────────────────────────────
     builder.add_node("repo_investigator", repo_investigator_node)
     builder.add_node("doc_analyst", doc_analyst_node)
     builder.add_node("evidence_aggregator", evidence_aggregator_node)
-    builder.add_node("interim_end", interim_end_node)
+    builder.add_node("prosecutor", prosecutor_node)
+    builder.add_node("defense", defense_node)
+    builder.add_node("tech_lead", tech_lead_node)
+    builder.add_node("judicial_aggregator", judicial_aggregator_node)
+    builder.add_node("chief_justice", chief_justice_node)
 
     # ── Detective Fan-Out — both nodes start concurrently from START ──────
     builder.add_edge(START, "repo_investigator")
     builder.add_edge(START, "doc_analyst")
 
     # ── Detective Fan-In — aggregator waits for BOTH branches ─────────────
-    # LangGraph only executes evidence_aggregator once both upstream nodes
-    # have completed and their state updates have been reduced.
     builder.add_edge("repo_investigator", "evidence_aggregator")
     builder.add_edge("doc_analyst", "evidence_aggregator")
 
-    # ── Sequential terminal (interim placeholder) ─────────────────────────
-    builder.add_edge("evidence_aggregator", "interim_end")
-    builder.add_edge("interim_end", END)
+    # ── Conditional routing — abort gracefully OR fan-out to judges ───────
+    # _route_after_evidence returns END (abort) or ["prosecutor","defense","tech_lead"]
+    # LangGraph interprets a returned list as a parallel fan-out.
+    builder.add_conditional_edges("evidence_aggregator", _route_after_evidence)
+
+    # ── Judicial Fan-In — aggregator waits for ALL THREE judges ───────────
+    builder.add_edge("prosecutor", "judicial_aggregator")
+    builder.add_edge("defense", "judicial_aggregator")
+    builder.add_edge("tech_lead", "judicial_aggregator")
+
+    # ── Supreme Court → END ───────────────────────────────────────────────
+    builder.add_edge("judicial_aggregator", "chief_justice")
+    builder.add_edge("chief_justice", END)
 
     compiled = builder.compile()
 
-    # Attach a default LangSmith run name so every trace is identifiable.
-    # LANGCHAIN_TRACING_V2=true must be set in .env for traces to appear.
     return compiled.with_config(
         {
             "run_name": "automaton-auditor",
-            "tags": ["detective-layer", "interim-submission"],
-            "metadata": {"version": "0.1.0", "layer": "detective"},
+            "tags": ["detective-layer", "judicial-layer", "final-submission"],
+            "metadata": {"version": "1.0.0", "layer": "full"},
         }
     )
 
@@ -373,10 +441,6 @@ def build_graph() -> Any:
 def create_initial_state(repo_url: str, pdf_path: str) -> AgentState:
     """Build a fully typed initial ``AgentState`` for an audit run.
 
-    All fields required by the TypedDict are present.  The ``evidences``
-    and ``opinions`` reducers start from their identity elements (``{}``
-    and ``[]`` respectively) so the first node update is a clean merge.
-
     Parameters
     ----------
     repo_url:
@@ -388,29 +452,36 @@ def create_initial_state(repo_url: str, pdf_path: str) -> AgentState:
         "repo_url": repo_url,
         "pdf_path": pdf_path,
         "rubric_dimensions": _load_rubric_dimensions(),
-        "evidences": {},    # identity for operator.ior (dict merge)
-        "opinions": [],     # identity for operator.add (list concat)
+        "evidences": {},   # identity for operator.ior (dict merge)
+        "opinions": [],    # identity for operator.add (list concat)
         "final_report": None,
     }
 
 
 # ---------------------------------------------------------------------------
-# Convenience runner
+# Convenience runners
 # ---------------------------------------------------------------------------
 
 
-def run_interim_audit(
+def run_full_audit(
     repo_url: str,
     pdf_path: str,
     langsmith_project: str = "automaton-auditor",
 ) -> AgentState:
-    """Run the full detective swarm and return the enriched ``AgentState``.
+    """Run the complete Digital Courtroom pipeline and return the final AgentState.
+
+    Pipeline
+    --------
+    1. Detective phase  — RepoInvestigator + DocAnalyst run in parallel
+    2. Aggregation      — EvidenceAggregator cross-references and validates
+    3. Judicial phase   — Prosecutor, Defense, TechLead run in parallel
+    4. Synthesis        — ChiefJustice applies deterministic rules
+    5. Report           — AuditReport serialised to audit/<repo>_<ts>.md
 
     Environment
     -----------
     Set ``LANGCHAIN_TRACING_V2=true`` and ``LANGCHAIN_API_KEY`` in ``.env``
-    to stream traces to LangSmith.  The function calls ``load_dotenv()``
-    at module import, so a local ``.env`` file is picked up automatically.
+    to stream traces to LangSmith.
 
     Parameters
     ----------
@@ -424,40 +495,62 @@ def run_interim_audit(
     Returns
     -------
     AgentState
-        Final state after the detective phase; ``state["evidences"]``
-        contains all collected Evidence keyed by ``criterion_id``.
+        Final state containing ``state["evidences"]``, ``state["opinions"]``,
+        and ``state["final_report"]`` (an ``AuditReport`` or ``None`` on abort).
     """
-    # Ensure the LangSmith project name is set before the graph runs.
-    # LANGCHAIN_TRACING_V2 is loaded from .env via load_dotenv() above.
     os.environ.setdefault("LANGCHAIN_PROJECT", langsmith_project)
 
     graph = build_graph()
     initial_state = create_initial_state(repo_url, pdf_path)
 
-    # Per-run config overrides the default set in build_graph().with_config()
     repo_name = repo_url.rstrip("/").rsplit("/", 1)[-1]
     run_config: dict[str, Any] = {
         "run_name": f"automaton-auditor | {repo_name}",
-        "tags": ["detective-layer", "interim-submission"],
+        "tags": ["detective-layer", "judicial-layer", "final-submission"],
         "metadata": {
             "repo_url": repo_url,
             "pdf_path": pdf_path,
-            "submission": "interim",
+            "submission": "final",
         },
     }
 
     logger.info(
-        "[Graph] Launching detective swarm — repo: %s | pdf: %s",
+        "[Graph] Launching full Digital Courtroom audit — repo: %s | pdf: %s",
         repo_url,
         pdf_path,
     )
     result: AgentState = graph.invoke(initial_state, config=run_config)
-    logger.info(
-        "[Graph] Audit complete — %d criteria, %d evidence items",
-        len(result.get("evidences", {})),  # type: ignore[call-overload]
-        sum(len(v) for v in result.get("evidences", {}).values()),  # type: ignore[call-overload]
-    )
+
+    final_report = result.get("final_report")  # type: ignore[call-overload]
+    if final_report is not None:
+        logger.info(
+            "[Graph] Audit complete — overall_score=%.2f/5.0 | "
+            "criteria=%d | opinions=%d",
+            final_report.overall_score,
+            len(final_report.criteria),
+            len(result.get("opinions", [])),  # type: ignore[call-overload]
+        )
+    else:
+        logger.warning("[Graph] Audit ended without a final report (graceful abort or error).")
+
     return result
+
+
+def run_interim_audit(
+    repo_url: str,
+    pdf_path: str,
+    langsmith_project: str = "automaton-auditor",
+) -> AgentState:
+    """Backward-compatible alias for ``run_full_audit()``.
+
+    .. deprecated::
+        Use ``run_full_audit()`` directly.  This alias remains to avoid
+        breaking any existing scripts that reference the interim runner.
+    """
+    logger.warning(
+        "[Graph] run_interim_audit() is deprecated — use run_full_audit() instead."
+    )
+    return run_full_audit(repo_url, pdf_path, langsmith_project)
 
 
 # ---------------------------------------------------------------------------
@@ -467,8 +560,10 @@ def run_interim_audit(
 __all__: list[str] = [
     "build_graph",
     "create_initial_state",
+    "run_full_audit",
     "run_interim_audit",
     "evidence_aggregator_node",
-    "interim_end_node",
+    "judicial_aggregator_node",
     "REQUIRED_INTERIM_CRITERIA",
+    "REQUIRED_ALL_CRITERIA",
 ]
