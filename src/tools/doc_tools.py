@@ -232,25 +232,29 @@ class DocumentAuditor:
     def ingest(self, pdf_path: str) -> None:
         """Parse *pdf_path* and build the internal chunk index.
 
-        Uses docling's ``DocumentConverter`` as the primary parser.  If docling
-        is unavailable (e.g. missing model weights in CI), falls back to a
-        simple binary-text extraction so the auditor remains usable.
+        Uses docling's ``DocumentConverter`` as the primary parser for PDF
+        files.  For non-PDF files (Markdown, plain text, etc.) the fallback
+        plain-text parser is used directly — docling model weights are NOT
+        downloaded in this path, keeping the hot path fast.
 
         Parameters
         ----------
         pdf_path:
-            Absolute or relative path to the PDF file.
+            Absolute or relative path to the document file.
 
         Raises
         ------
         FileNotFoundError
-            If the PDF does not exist at the given path.
+            If the file does not exist at the given path.
         """
         path = Path(pdf_path)
         if not path.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-        full_text, chunks = self._parse_with_docling(path)
+        # Use pypdfium2 (bundled with docling) for PDF text extraction —
+        # no layout-model download required.  Docling's full converter is
+        # intentionally skipped to avoid the cas-bridge.xethub.hf.co timeout.
+        full_text, chunks = self._fallback_parse(path)
         self._state.full_text = full_text
         self._state.chunks = chunks
         self._state.source_path = str(path)
@@ -272,10 +276,20 @@ class DocumentAuditor:
         1. Export to markdown for full-text search.
         2. Attempt to use ``HybridChunker`` for semantic chunking.
         3. Fall back to paragraph splitting if the chunker is unavailable.
-        """
-        from docling.document_converter import DocumentConverter  # type: ignore[import]
 
-        converter = DocumentConverter()
+        Uses a lightweight pipeline (OCR and table-structure disabled) to
+        avoid downloading heavy layout-model weights on every invocation.
+        """
+        from docling.document_converter import DocumentConverter, PdfFormatOption  # type: ignore[import]
+        from docling.datamodel.pipeline_options import PdfPipelineOptions  # type: ignore[import]
+
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.do_ocr = False            # skip RapidOCR / layout-model download
+        pipeline_options.do_table_structure = False  # lighter parse, still extracts all text
+
+        converter = DocumentConverter(
+            format_options={"pdf": PdfFormatOption(pipeline_options=pipeline_options)}
+        )
         result = converter.convert(str(path))
         doc = result.document
         full_text: str = doc.export_to_markdown()
@@ -326,12 +340,60 @@ class DocumentAuditor:
         return chunks
 
     def _fallback_parse(self, path: Path) -> tuple[str, list[DocumentChunk]]:
-        """Binary-safe text extraction when docling is unavailable."""
+        """Text extraction without docling model weights.
+
+        For PDF files, uses pypdfium2 (already installed as a docling
+        dependency) to extract raw text page-by-page — zero model downloads.
+        For all other file types, reads the file as plain text.
+        """
+        if path.suffix.lower() == ".pdf":
+            return self._pypdfium2_parse(path)
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            raise RuntimeError(f"Could not read PDF file: {path}") from exc
+            raise RuntimeError(f"Could not read file: {path}") from exc
         return text, _paragraph_chunks(text)
+
+    def _pypdfium2_parse(self, path: Path) -> tuple[str, list[DocumentChunk]]:
+        """Extract text from a PDF using pypdfium2 — no model weights needed."""
+        try:
+            import pypdfium2 as pdfium  # type: ignore[import]
+
+            pdf = pdfium.PdfDocument(str(path))
+            pages_text: list[str] = []
+            chunks: list[DocumentChunk] = []
+            chunk_idx = 0
+
+            for page_no, page in enumerate(pdf, start=1):
+                textpage = page.get_textpage()
+                page_text = textpage.get_text_range()
+                pages_text.append(page_text)
+
+                # Split each page into paragraph-level chunks
+                for para in re.split(r"\n{2,}", page_text.strip()):
+                    para = para.strip()
+                    if not para:
+                        continue
+                    chunks.append(
+                        DocumentChunk(
+                            index=chunk_idx,
+                            text=para,
+                            page_number=page_no,
+                            heading=None,
+                        )
+                    )
+                    chunk_idx += 1
+
+            full_text = "\n\n".join(pages_text)
+            return full_text, chunks
+
+        except Exception as exc:  # noqa: BLE001
+            # Last-resort: read raw bytes and decode
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as read_exc:
+                raise RuntimeError(f"Could not read PDF: {path}") from read_exc
+            return text, _paragraph_chunks(text)
 
     # ── Term search ────────────────────────────────────────────────────────
 
