@@ -632,16 +632,29 @@ class GraphForensics:
         return fields
 
     def _find_stategraph_variable(self, tree: ast.AST) -> Optional[str]:
-        """Return the variable name bound to ``StateGraph(...)``, or ``None``."""
+        """Return the variable name bound to ``StateGraph(...)``, or ``None``.
+
+        Handles both plain assignments and annotated assignments:
+          builder = StateGraph(AgentState)          → ast.Assign
+          builder: StateGraph = StateGraph(AgentState) → ast.AnnAssign
+        """
+        _SG_NAMES = ("StateGraph", "CompiledStateGraph")
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign):
-                continue
-            if not isinstance(node.value, ast.Call):
-                continue
-            if _name_from_node(node.value.func) in ("StateGraph", "CompiledStateGraph"):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        return target.id
+            # Plain assignment: builder = StateGraph(AgentState)
+            if isinstance(node, ast.Assign):
+                if isinstance(node.value, ast.Call) and _name_from_node(node.value.func) in _SG_NAMES:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            return target.id
+            # Annotated assignment: builder: StateGraph = StateGraph(AgentState)
+            elif isinstance(node, ast.AnnAssign):
+                if (
+                    node.value is not None
+                    and isinstance(node.value, ast.Call)
+                    and _name_from_node(node.value.func) in _SG_NAMES
+                    and isinstance(node.target, ast.Name)
+                ):
+                    return node.target.id
         return None
 
     def _extract_edge_calls(self, tree: ast.AST) -> list[EdgeCall]:
