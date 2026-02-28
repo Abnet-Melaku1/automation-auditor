@@ -108,23 +108,24 @@ def repo_investigator_node(state: AgentState) -> dict[str, Any]:
         investigator = RepoInvestigator(repo_url)
         evidence_map = investigator.run_all()
         logger.info(
-            "[RepoInvestigator] Completed. Criteria collected: %s",
+            "[RepoInvestigator] Completed. Criteria collected: %s | repo_files: %d",
             sorted(evidence_map.keys()),
+            len(investigator.repo_files),
         )
-        return {"evidences": evidence_map}
+        return {"evidences": evidence_map, "repo_files": investigator.repo_files}
 
     except ValueError as exc:
         # URL validation failure — not a transient error; no retry
         logger.error("[RepoInvestigator] Invalid repository URL: %s", exc)
-        return {"evidences": _clone_failure_map(str(exc), repo_url)}
+        return {"evidences": _clone_failure_map(str(exc), repo_url), "repo_files": []}
 
     except CloneError as exc:
         logger.error("[RepoInvestigator] Clone failed: %s", exc)
-        return {"evidences": _clone_failure_map(str(exc), repo_url)}
+        return {"evidences": _clone_failure_map(str(exc), repo_url), "repo_files": []}
 
     except Exception as exc:  # noqa: BLE001 — surface unexpected errors as Evidence
         logger.exception("[RepoInvestigator] Unexpected error during analysis")
-        return {"evidences": _clone_failure_map(str(exc), repo_url)}
+        return {"evidences": _clone_failure_map(str(exc), repo_url), "repo_files": []}
 
 
 # ---------------------------------------------------------------------------

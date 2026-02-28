@@ -58,6 +58,17 @@ MAX_RETRIES: int = 3
 RETRY_DELAY_SECONDS: float = 5.0       # default delay between non-429 retries
 _RATE_LIMIT_BUFFER_SECONDS: float = 8.0  # extra buffer added on top of API retryDelay
 
+# Thundering-herd mitigation for free-tier API quota.
+# Three judges fan-out in parallel; without offsets they all fire simultaneously
+# per criterion, exhausting the per-minute token quota in one burst.
+# Startup offset staggers the initial request; inter-criterion delay paces the loop.
+_JUDGE_STARTUP_OFFSET: dict[str, float] = {
+    "Prosecutor": 0.0,    # fires immediately
+    "Defense":    90.0,   # waits 90 s — lets Prosecutor clear 2-3 criteria first
+    "TechLead":   180.0,  # waits 3 min — runs almost entirely after Defense
+}
+_INTER_CRITERION_DELAY_SECONDS: float = 15.0  # pause between criteria within a judge
+
 # Model is configurable via GEMINI_MODEL env var.
 # Default: gemini-2.5-flash (current free-tier model; 2.0/1.5 series deprecated).
 _MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -179,7 +190,7 @@ def _format_evidence_block(criterion_id: str, evidences: list[Evidence]) -> str:
         lines.append(f"     Rationale:  {ev.rationale}")
         if ev.content:
             # Truncate long content to stay within token budget
-            content = ev.content[:1200] + "\n…(truncated)" if len(ev.content) > 1200 else ev.content
+            content = ev.content[:2500] + "\n…(truncated)" if len(ev.content) > 2500 else ev.content
             lines.append(f"     Content:\n{content}")
     lines.append("╚══════════════════════════════════════╝")
     return "\n".join(lines)
@@ -373,6 +384,14 @@ def _run_judge(persona: str, state: AgentState) -> dict[str, Any]:
 
     opinions: list[JudicialOpinion] = []
 
+    # Thundering-herd mitigation: stagger judge startup so all three don't
+    # hit the API simultaneously on the first criterion.
+    startup_offset = _JUDGE_STARTUP_OFFSET.get(persona, 0.0)
+    if startup_offset > 0:
+        logger.debug("[%s] Startup offset %.0fs — waiting before first criterion", persona, startup_offset)
+        time.sleep(startup_offset)
+
+    first_criterion = True
     for criterion_id, ev_list in evidences.items():
         if not ev_list:
             logger.warning(
@@ -381,6 +400,12 @@ def _run_judge(persona: str, state: AgentState) -> dict[str, Any]:
                 criterion_id,
             )
             continue
+
+        # Inter-criterion delay after the first one to pace API usage
+        if not first_criterion:
+            logger.debug("[%s] Inter-criterion delay %.0fs", persona, _INTER_CRITERION_DELAY_SECONDS)
+            time.sleep(_INTER_CRITERION_DELAY_SECONDS)
+        first_criterion = False
 
         rubric_dim = rubric_lookup.get(
             criterion_id,
@@ -419,7 +444,7 @@ def prosecutor_node(state: AgentState) -> dict[str, Any]:
         ``{"opinions": [JudicialOpinion(judge="Prosecutor", ...)]}``
         merged into ``AgentState.opinions`` via ``operator.add``.
     """
-    logger.info("[Prosecutor] Convening adversarial review")
+    logger.info("[Prosecutor] Convening adversarial review (no startup offset)")
     return _run_judge("Prosecutor", state)
 
 
@@ -435,7 +460,7 @@ def defense_node(state: AgentState) -> dict[str, Any]:
         ``{"opinions": [JudicialOpinion(judge="Defense", ...)]}``
         merged into ``AgentState.opinions`` via ``operator.add``.
     """
-    logger.info("[Defense] Convening advocacy review")
+    logger.info("[Defense] Convening advocacy review (+12s startup offset)")
     return _run_judge("Defense", state)
 
 
@@ -451,7 +476,7 @@ def tech_lead_node(state: AgentState) -> dict[str, Any]:
         ``{"opinions": [JudicialOpinion(judge="TechLead", ...)]}``
         merged into ``AgentState.opinions`` via ``operator.add``.
     """
-    logger.info("[TechLead] Convening technical review")
+    logger.info("[TechLead] Convening technical review (+24s startup offset)")
     return _run_judge("TechLead", state)
 
 

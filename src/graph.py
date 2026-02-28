@@ -200,25 +200,30 @@ def evidence_aggregator_node(state: AgentState) -> dict[str, Any]:
 def _cross_reference_report_accuracy(
     state: AgentState,
 ) -> dict[str, list[Evidence]] | None:
-    """Finalise the report_accuracy cross-reference using repo file locations.
+    """Finalise the report_accuracy cross-reference using the repo file catalog.
 
     DocAnalyst extracted path claims during parallel execution but could not
     verify them (the repo file list wasn't available yet).  Now that both
-    branches have merged, we can perform the cross-reference.
+    branches have merged, we use the complete file catalog populated by
+    RepoInvestigator (stored in ``state["repo_files"]``) to cross-reference.
+
+    Falls back to deriving known paths from Evidence.location strings when
+    ``repo_files`` is empty (e.g. if the repo clone failed).
     """
     evidences: dict[str, list[Evidence]] = state.get("evidences", {})  # type: ignore[call-overload]
 
-    # Collect known repo file paths from all repo-detective Evidence
-    repo_locations: set[str] = set()
-    for criterion_id in _REPO_CRITERIA:
-        for ev in evidences.get(criterion_id, []):
-            loc = ev.location
-            clean = loc.split(":")[0].strip()
-            if "/" in clean and not clean.startswith("http") and "." in clean.split("/")[-1]:
-                repo_locations.add(clean)
+    # ── Primary: use the pre-built repo file catalog ──────────────────────
+    repo_files: list[str] = state.get("repo_files", [])  # type: ignore[call-overload]
 
-    if not repo_locations:
-        return None  # Repo clone failed — cannot cross-reference
+    # ── Fallback: derive known paths from Evidence.location strings ───────
+    if not repo_files:
+        for criterion_id in _REPO_CRITERIA:
+            for ev in evidences.get(criterion_id, []):
+                loc = ev.location.replace("\\", "/").split(":")[0].strip()
+                if "/" in loc and not loc.startswith("http") and "." in loc.split("/")[-1]:
+                    repo_files.append(loc)
+        if not repo_files:
+            return None  # Repo clone failed — cannot cross-reference
 
     # Collect the claimed paths DocAnalyst extracted
     claimed_paths: list[str] = []
@@ -233,7 +238,7 @@ def _cross_reference_report_accuracy(
         return None
 
     # Perform the cross-reference
-    repo_norm = {p.replace("\\", "/").lstrip("./") for p in repo_locations}
+    repo_norm = {p.replace("\\", "/").lstrip("./") for p in repo_files}
     verified: list[str] = []
     hallucinated: list[str] = []
     for path in claimed_paths:
@@ -454,6 +459,7 @@ def create_initial_state(repo_url: str, pdf_path: str) -> AgentState:
         "rubric_dimensions": _load_rubric_dimensions(),
         "evidences": {},   # identity for operator.ior (dict merge)
         "opinions": [],    # identity for operator.add (list concat)
+        "repo_files": [],  # populated by repo_investigator_node after clone
         "final_report": None,
     }
 

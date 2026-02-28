@@ -303,6 +303,14 @@ class AgentState(TypedDict):
     so every opinion is preserved for the ChiefJustice to deliberate over.
     """
 
+    # ── Repository file catalog ──────────────────────────────────────────────
+    repo_files: List[str]
+    """Flat list of all source file paths (POSIX, relative to repo root) found
+    in the cloned repository.  Populated by ``repo_investigator_node`` once the
+    clone succeeds; empty list when the clone fails.  Consumed by
+    ``evidence_aggregator_node`` to cross-reference paths claimed in the PDF
+    report.  Not Annotated — only one node writes to this field."""
+
     # ── Supreme Court output ────────────────────────────────────────────────
     final_report: Optional[AuditReport]
     """The fully synthesised audit report; ``None`` until ChiefJusticeNode runs."""

@@ -809,6 +809,10 @@ class RepoInvestigator:
         _validate_repo_url(repo_url)
         self.repo_url = repo_url
         self._forensics = GraphForensics()
+        self.repo_files: list[str] = []
+        """Flat list of POSIX-style relative paths for every source file found
+        in the cloned repository.  Populated by ``run_all()``; consumed by the
+        ``evidence_aggregator_node`` for report-accuracy cross-referencing."""
 
     def run_all(self) -> dict[str, list[Evidence]]:
         """Clone once, run all protocols, return criterion-keyed Evidence map.
@@ -821,6 +825,14 @@ class RepoInvestigator:
             with RepoManager() as mgr:
                 repo_path = mgr.clone(self.repo_url)
                 commits = mgr.git_log(repo_path)
+                # Collect all source files for cross-referencing before tmpdir exits
+                self.repo_files = sorted(
+                    str(f.relative_to(repo_path)).replace("\\", "/")
+                    for f in repo_path.rglob("*")
+                    if f.is_file()
+                    and not any(part.startswith(".") for part in f.relative_to(repo_path).parts)
+                    and f.suffix in (".py", ".json", ".toml", ".md", ".txt", ".yaml", ".yml")
+                )
                 return {
                     "git_forensic_analysis": [
                         self._investigate_git_history(commits)
@@ -885,7 +897,7 @@ class RepoInvestigator:
         for candidate in candidates:
             if candidate.exists():
                 result = self._forensics.analyze_state_file(candidate)
-                location = str(candidate.relative_to(repo_path))
+                location = str(candidate.relative_to(repo_path)).replace("\\", "/")
                 break
 
         if result is None:

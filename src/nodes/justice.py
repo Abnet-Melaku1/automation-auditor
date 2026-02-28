@@ -14,6 +14,10 @@ Applied in strict priority order:
 
   1. security_override      — Confirmed security violations cap the final score at 3,
                               regardless of Defense effort arguments.
+                              Fires only when BOTH Prosecutor score ≤ 2 (with security
+                              keyword) AND TechLead score ≤ 3 (binary facts confirm the
+                              flaw).  A TechLead score ≥ 4 indicates the violation is
+                              unconfirmed — Prosecutor uncertainty, not a real flaw.
 
   2. fact_supremacy         — If ALL detective Evidence for a criterion has found=False
                               AND the Defense score is inflated above both other judges,
@@ -147,7 +151,10 @@ def _synthesize_score(
     applied: list[str] = []
 
     # ── Rule 1: Security Override (highest priority) ───────────────────────
-    if _is_security_violation(prosecutor):
+    # Requires BOTH Prosecutor suspicion AND TechLead binary confirmation.
+    # If TechLead (binary facts) scores ≥ 4, the violation is unconfirmed —
+    # the Prosecutor was confused by other code, not a real security flaw.
+    if _is_security_violation(prosecutor) and tech_lead.score <= 3:
         capped = min(3, tech_lead.score)
         applied.append(
             f"security_override: Prosecutor confirmed security violation "
