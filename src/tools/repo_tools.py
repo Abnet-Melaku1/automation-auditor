@@ -849,6 +849,12 @@ class RepoInvestigator:
                     "structured_output_enforcement": [
                         self._investigate_structured_output(repo_path)
                     ],
+                    "chief_justice_synthesis": [
+                        self._investigate_chief_justice_synthesis(repo_path)
+                    ],
+                    "judicial_nuance": [
+                        self._investigate_judicial_nuance(repo_path)
+                    ],
                 }
         except CloneError as exc:
             return {
@@ -1016,6 +1022,180 @@ class RepoInvestigator:
             ),
             confidence=confidence,
             criterion_id="safe_tool_engineering",
+        )
+
+    def _investigate_chief_justice_synthesis(self, repo_path: Path) -> Evidence:
+        """Verify justice.py implements deterministic named conflict-resolution rules."""
+        justice_file = repo_path / "src" / "nodes" / "justice.py"
+        if not justice_file.exists():
+            return Evidence(
+                goal="Verify deterministic Chief Justice synthesis with named rules",
+                found=False,
+                content=None,
+                location="src/nodes/justice.py (not found)",
+                rationale="src/nodes/justice.py does not exist; ChiefJusticeNode cannot be verified.",
+                confidence=0.98,
+                criterion_id="chief_justice_synthesis",
+            )
+
+        text = justice_file.read_text(encoding="utf-8", errors="replace")
+        text_lower = text.lower()
+
+        # Rule checks — scan for named rule implementations
+        has_security_override = (
+            "security_override" in text_lower or
+            ("cap" in text_lower and "3" in text and "prosecutor" in text_lower)
+        )
+        has_fact_supremacy = (
+            "fact_supremacy" in text_lower or
+            "defense.*overrul" in text_lower or
+            ("found=false" in text_lower and "overrul" in text_lower) or
+            "_is_defense_overruled" in text
+        )
+        has_functionality_weight = (
+            "functionality_weight" in text_lower or
+            "tech_lead" in text_lower and "0.50" in text or
+            "techlead" in text_lower and "weight" in text_lower
+        )
+        has_variance_reeval = (
+            "variance_re_evaluation" in text_lower or
+            "variance" in text_lower and "threshold" in text_lower
+        )
+        has_dissent = (
+            "dissent" in text_lower
+        )
+        has_markdown_output = (
+            ".write_text" in text or
+            ".md" in text or
+            "markdown" in text_lower
+        )
+        # LLM guard — no LLM calls in Chief Justice (must be deterministic)
+        llm_calls = any(
+            kw in text_lower for kw in (
+                "llm.invoke", "chatanthropic", "chatopenai",
+                "with_structured_output", "llm.bind",
+            )
+        )
+        is_deterministic = not llm_calls
+
+        rules_found = sum([
+            has_security_override,
+            has_fact_supremacy,
+            has_functionality_weight,
+            has_variance_reeval,
+        ])
+        passes = is_deterministic and rules_found >= 3 and has_markdown_output
+
+        rationale = (
+            f"deterministic(no_llm)={'✓' if is_deterministic else '✗ LLM calls detected'}  "
+            f"security_override={'✓' if has_security_override else '✗'}  "
+            f"fact_supremacy={'✓' if has_fact_supremacy else '✗'}  "
+            f"functionality_weight={'✓' if has_functionality_weight else '✗'}  "
+            f"variance_re_evaluation={'✓' if has_variance_reeval else '✗'}  "
+            f"dissent_summary={'✓' if has_dissent else '✗'}  "
+            f"markdown_output={'✓' if has_markdown_output else '✗'}  "
+            f"rules_found={rules_found}/4"
+        )
+
+        # Capture key rule implementations as evidence snippet
+        snippet_lines = []
+        for i, line in enumerate(text.splitlines()):
+            ll = line.lower()
+            if any(kw in ll for kw in (
+                "security_override", "fact_supremacy", "functionality_weight",
+                "variance_re_evaluation", "dissent", "write_text",
+            )):
+                snippet_lines.append(f"L{i+1}: {line.strip()}")
+        content = "\n".join(snippet_lines[:40]) or None
+
+        return Evidence(
+            goal="Verify deterministic Chief Justice synthesis with named rules",
+            found=passes,
+            content=content,
+            location="src/nodes/justice.py",
+            rationale=rationale,
+            confidence=0.92 if passes else 0.88,
+            criterion_id="chief_justice_synthesis",
+        )
+
+    def _investigate_judicial_nuance(self, repo_path: Path) -> Evidence:
+        """Verify judges.py has three distinct, conflicting personas running in parallel."""
+        judges_file = repo_path / "src" / "nodes" / "judges.py"
+        if not judges_file.exists():
+            return Evidence(
+                goal="Verify distinct Prosecutor/Defense/TechLead personas with parallel execution",
+                found=False,
+                content=None,
+                location="src/nodes/judges.py (not found)",
+                rationale="src/nodes/judges.py does not exist; judicial personas cannot be verified.",
+                confidence=0.98,
+                criterion_id="judicial_nuance",
+            )
+
+        text = judges_file.read_text(encoding="utf-8", errors="replace")
+        text_lower = text.lower()
+
+        # Persona presence
+        has_prosecutor = "prosecutor" in text_lower
+        has_defense = "defense" in text_lower
+        has_techlead = "techlead" in text_lower or "tech_lead" in text_lower or "tech lead" in text_lower
+
+        # Adversarial language for Prosecutor
+        adversarial_kws = ("adversar", "critical", "flaw", "fail", "security", "lazy", "gap", "missing")
+        has_prosecutor_adversarial = any(kw in text_lower for kw in adversarial_kws)
+
+        # Forgiving language for Defense
+        forgiving_kws = ("effort", "intent", "reward", "forgi", "creative", "workaround", "merit")
+        has_defense_forgiving = any(kw in text_lower for kw in forgiving_kws)
+
+        # Technical/pragmatic language for TechLead
+        pragmatic_kws = ("architectural", "soundness", "maintainab", "pragmatic", "modular", "viab")
+        has_techlead_pragmatic = any(kw in text_lower for kw in pragmatic_kws)
+
+        # Parallel execution — all three judges have separate node functions
+        has_parallel = (
+            "prosecutor_node" in text_lower or "prosecutornode" in text_lower or
+            "defense_node" in text_lower or "defensenode" in text_lower
+        ) and (
+            "techlead_node" in text_lower or "techleadnode" in text_lower or
+            "tech_lead_node" in text_lower
+        )
+
+        all_personas = has_prosecutor and has_defense and has_techlead
+        persona_differentiation = sum([
+            has_prosecutor_adversarial,
+            has_defense_forgiving,
+            has_techlead_pragmatic,
+        ])
+
+        passes = all_personas and persona_differentiation >= 2 and has_parallel
+
+        rationale = (
+            f"prosecutor={'✓' if has_prosecutor else '✗'}  "
+            f"defense={'✓' if has_defense else '✗'}  "
+            f"techlead={'✓' if has_techlead else '✗'}  "
+            f"prosecutor_adversarial={'✓' if has_prosecutor_adversarial else '✗'}  "
+            f"defense_forgiving={'✓' if has_defense_forgiving else '✗'}  "
+            f"techlead_pragmatic={'✓' if has_techlead_pragmatic else '✗'}  "
+            f"parallel_nodes={'✓' if has_parallel else '✗'}  "
+            f"persona_differentiation={persona_differentiation}/3"
+        )
+
+        snippet_lines = []
+        for i, line in enumerate(text.splitlines()):
+            ll = line.lower()
+            if any(kw in ll for kw in ("prosecutor", "defense", "techlead", "tech_lead", "system")):
+                snippet_lines.append(f"L{i+1}: {line.strip()}")
+        content = "\n".join(snippet_lines[:40]) or None
+
+        return Evidence(
+            goal="Verify distinct Prosecutor/Defense/TechLead personas with parallel execution",
+            found=passes,
+            content=content,
+            location="src/nodes/judges.py",
+            rationale=rationale,
+            confidence=0.88 if passes else 0.85,
+            criterion_id="judicial_nuance",
         )
 
     def _investigate_structured_output(self, repo_path: Path) -> Evidence:

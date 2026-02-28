@@ -5,24 +5,27 @@ Graph topology (final)
 ----------------------
 
     START
-      ├────────────────────────────────────────────┐
-      │                                            │
-      ▼                                            ▼
-  repo_investigator                           doc_analyst
-  (RepoInvestigator)                          (DocAnalyst)
-      │  evidences["git_forensic_analysis"]        │  evidences["theoretical_depth"]
-      │  evidences["state_management_rigor"]        │  evidences["report_accuracy"]
-      │  evidences["graph_orchestration"]           │
-      │  evidences["safe_tool_engineering"]         │
-      │  evidences["structured_output_enforcement"] │
-      │                                            │
-      └──────────────────┬─────────────────────────┘
-                         │  operator.ior merges both branches
-                         ▼
-               evidence_aggregator  ← Detective Fan-In
-               - completeness check
-               - secondary report_accuracy cross-reference
-               - conditional route: no evidence → END (graceful abort)
+      ├───────────────────────────┬─────────────────────────────┐
+      │                           │                             │
+      ▼                           ▼                             ▼
+  repo_investigator           doc_analyst               vision_inspector
+  (RepoInvestigator)          (DocAnalyst)              (VisionInspector)
+      │  git_forensic_analysis    │  theoretical_depth          │  swarm_visual
+      │  state_management_rigor   │  report_accuracy            │
+      │  graph_orchestration      │                             │
+      │  safe_tool_engineering    │                             │
+      │  structured_output        │                             │
+      │  chief_justice_synthesis  │                             │
+      │  judicial_nuance          │                             │
+      │                           │                             │
+      └─────────────────────────┬─┴─────────────────────────────┘
+                                 │  operator.ior merges all three branches
+                                 ▼
+                       evidence_aggregator  ← Detective Fan-In
+                       - completeness check
+                       - secondary report_accuracy cross-reference
+                       - semantic consistency cross-reference (PDF ↔ code)
+                       - conditional route: no evidence → END (graceful abort)
                          │
            ┌─────────────┼─────────────┐
            │             │             │
@@ -80,7 +83,7 @@ from typing import Any
 from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
 
-from src.nodes.detectives import doc_analyst_node, repo_investigator_node
+from src.nodes.detectives import doc_analyst_node, repo_investigator_node, vision_inspector_node
 from src.nodes.judges import defense_node, prosecutor_node, tech_lead_node
 from src.nodes.justice import chief_justice_node
 from src.state import AgentState, Evidence, JudicialOpinion
@@ -100,6 +103,8 @@ _REPO_CRITERIA: frozenset[str] = frozenset(
         "graph_orchestration",
         "safe_tool_engineering",
         "structured_output_enforcement",
+        "chief_justice_synthesis",
+        "judicial_nuance",
     }
 )
 
@@ -111,8 +116,15 @@ _PDF_CRITERIA: frozenset[str] = frozenset(
     }
 )
 
+#: Rubric criteria covered by VisionInspector
+_VISION_CRITERIA: frozenset[str] = frozenset(
+    {
+        "swarm_visual",
+    }
+)
+
 #: All detective-phase criteria (used for completeness check)
-REQUIRED_INTERIM_CRITERIA: frozenset[str] = _REPO_CRITERIA | _PDF_CRITERIA
+REQUIRED_INTERIM_CRITERIA: frozenset[str] = _REPO_CRITERIA | _PDF_CRITERIA | _VISION_CRITERIA
 
 #: Full rubric (detective + judicial coverage)
 REQUIRED_ALL_CRITERIA: frozenset[str] = REQUIRED_INTERIM_CRITERIA
@@ -191,10 +203,23 @@ def evidence_aggregator_node(state: AgentState) -> dict[str, Any]:
 
     # ── 3. Secondary cross-reference for report_accuracy ─────────────────
     xref_update = _cross_reference_report_accuracy(state)
-    if xref_update:
-        return {"evidences": xref_update}
 
-    return {}
+    # ── 4. Semantic consistency cross-reference ───────────────────────────
+    # Compare claims in the PDF report against what the code evidence found.
+    # Detects contradictions like "PDF says parallel" but code shows linear.
+    consistency_update = _cross_reference_detective_consistency(state)
+
+    merged: dict[str, list[Evidence]] = {}
+    if xref_update:
+        merged.update(xref_update)
+    if consistency_update:
+        for criterion_id, new_evs in consistency_update.items():
+            if criterion_id in merged:
+                merged[criterion_id] = merged[criterion_id] + new_evs
+            else:
+                merged[criterion_id] = new_evs
+
+    return {"evidences": merged} if merged else {}
 
 
 def _cross_reference_report_accuracy(
@@ -273,6 +298,105 @@ def _cross_reference_report_accuracy(
 
     existing = list(evidences.get("report_accuracy", []))
     return {"report_accuracy": existing + [xref_evidence]}
+
+
+def _cross_reference_detective_consistency(
+    state: AgentState,
+) -> dict[str, list[Evidence]] | None:
+    """Semantic consistency check: compare PDF claims against code evidence.
+
+    Runs after all three detective branches have merged.  Detects
+    contradictions such as:
+    - PDF claims parallel execution but graph_orchestration evidence shows
+      a linear-only topology.
+    - PDF mentions Fan-In/Fan-Out substantively but swarm_visual diagram
+      shows a sequential pipeline.
+    - Code confirms chief_justice uses deterministic rules but PDF doesn't
+      explain Dialectical Synthesis.
+
+    Returns an additional Evidence item for ``graph_orchestration`` when a
+    contradiction or strong confirmation is found.
+    """
+    evidences: dict[str, list[Evidence]] = state.get("evidences", {})  # type: ignore[call-overload]
+
+    # ── Extract code signals from graph_orchestration evidence ────────────
+    graph_evs = evidences.get("graph_orchestration", [])
+    code_has_parallel = any(ev.found for ev in graph_evs)
+    code_is_linear = not code_has_parallel
+
+    # ── Extract PDF claims from theoretical_depth evidence ────────────────
+    depth_evs = evidences.get("theoretical_depth", [])
+    pdf_mentions_fanout = any(
+        ev.content and ("fan-out" in ev.content.lower() or "fan-in" in ev.content.lower())
+        for ev in depth_evs
+    )
+
+    # ── Extract visual evidence ────────────────────────────────────────────
+    visual_evs = evidences.get("swarm_visual", [])
+    visual_shows_parallel = any(
+        ev.found or (ev.content and "parallel" in (ev.content or "").lower())
+        for ev in visual_evs
+    )
+
+    # ── Chief Justice code signals ─────────────────────────────────────────
+    cj_evs = evidences.get("chief_justice_synthesis", [])
+    code_has_deterministic_cj = any(ev.found for ev in cj_evs)
+
+    # ── Build cross-reference verdict ─────────────────────────────────────
+    contradictions: list[str] = []
+    confirmations: list[str] = []
+
+    if code_has_parallel and pdf_mentions_fanout:
+        confirmations.append(
+            "PDF mentions Fan-In/Fan-Out AND code implements parallel graph topology — consistent."
+        )
+    elif code_is_linear and pdf_mentions_fanout:
+        contradictions.append(
+            "PDF claims Fan-In/Fan-Out but graph_orchestration evidence shows linear-only topology."
+        )
+
+    if visual_shows_parallel and code_has_parallel:
+        confirmations.append(
+            "Visual diagram shows parallel branches AND code confirms parallel graph wiring."
+        )
+    elif visual_shows_parallel and code_is_linear:
+        contradictions.append(
+            "Diagram shows parallel branches but code evidence shows linear flow — misleading diagram."
+        )
+
+    if code_has_deterministic_cj:
+        confirmations.append(
+            "Code confirms ChiefJustice uses deterministic synthesis rules (no LLM averaging)."
+        )
+
+    if not contradictions and not confirmations:
+        return None  # Nothing useful to add
+
+    content_lines = []
+    if confirmations:
+        content_lines += ["Confirmations (PDF ↔ code consistent):"] + [f"  + {c}" for c in confirmations]
+    if contradictions:
+        content_lines += ["Contradictions (PDF ↔ code inconsistent):"] + [f"  ! {c}" for c in contradictions]
+
+    cross_ev = Evidence(
+        goal="Verify semantic consistency between PDF report claims and code evidence",
+        found=bool(confirmations) and not contradictions,
+        content="\n".join(content_lines),
+        location="evidence_aggregator (consistency check)",
+        rationale=(
+            f"Cross-detective consistency: "
+            f"{len(confirmations)} confirmation(s), {len(contradictions)} contradiction(s). "
+            f"Code parallel={'yes' if code_has_parallel else 'no'}  "
+            f"PDF mentions fan-out={'yes' if pdf_mentions_fanout else 'no'}  "
+            f"Visual parallel={'yes' if visual_shows_parallel else 'no'}  "
+            f"Deterministic ChiefJustice={'yes' if code_has_deterministic_cj else 'no'}."
+        ),
+        confidence=0.82,
+        criterion_id="graph_orchestration",
+    )
+
+    existing = list(evidences.get("graph_orchestration", []))
+    return {"graph_orchestration": existing + [cross_ev]}
 
 
 # ---------------------------------------------------------------------------
@@ -375,18 +499,18 @@ def build_graph() -> Any:
     Graph structure (final submission)
     ------------------------------------
 
-        START → [repo_investigator ‖ doc_analyst]          (detective fan-out)
-              → evidence_aggregator                         (detective fan-in)
-              → conditional: empty evidence → END           (graceful abort)
-              → [prosecutor ‖ defense ‖ tech_lead]          (judicial fan-out)
-              → judicial_aggregator                         (judicial fan-in)
-              → chief_justice                               (deterministic synthesis)
+        START → [repo_investigator ‖ doc_analyst ‖ vision_inspector]  (detective fan-out)
+              → evidence_aggregator                                    (detective fan-in)
+              → conditional: empty evidence → END                      (graceful abort)
+              → [prosecutor ‖ defense ‖ tech_lead]                     (judicial fan-out)
+              → judicial_aggregator                                    (judicial fan-in)
+              → chief_justice                                          (deterministic synthesis)
               → END
 
     Two distinct parallel fan-out / fan-in patterns satisfy the rubric's
     graph_orchestration criterion:
-      • Detective fan-out/fan-in (START → detectives → evidence_aggregator)
-      • Judicial fan-out/fan-in  (evidence_aggregator → judges → judicial_aggregator)
+      • Detective fan-out/fan-in (START → 3 detectives → evidence_aggregator)
+      • Judicial fan-out/fan-in  (evidence_aggregator → 3 judges → judicial_aggregator)
 
     Returns
     -------
@@ -398,6 +522,7 @@ def build_graph() -> Any:
     # ── Register all nodes ────────────────────────────────────────────────
     builder.add_node("repo_investigator", repo_investigator_node)
     builder.add_node("doc_analyst", doc_analyst_node)
+    builder.add_node("vision_inspector", vision_inspector_node)
     builder.add_node("evidence_aggregator", evidence_aggregator_node)
     builder.add_node("prosecutor", prosecutor_node)
     builder.add_node("defense", defense_node)
@@ -405,13 +530,15 @@ def build_graph() -> Any:
     builder.add_node("judicial_aggregator", judicial_aggregator_node)
     builder.add_node("chief_justice", chief_justice_node)
 
-    # ── Detective Fan-Out — both nodes start concurrently from START ──────
+    # ── Detective Fan-Out — all three nodes start concurrently from START ─
     builder.add_edge(START, "repo_investigator")
     builder.add_edge(START, "doc_analyst")
+    builder.add_edge(START, "vision_inspector")
 
-    # ── Detective Fan-In — aggregator waits for BOTH branches ─────────────
+    # ── Detective Fan-In — aggregator waits for ALL THREE branches ────────
     builder.add_edge("repo_investigator", "evidence_aggregator")
     builder.add_edge("doc_analyst", "evidence_aggregator")
+    builder.add_edge("vision_inspector", "evidence_aggregator")
 
     # ── Conditional routing — abort gracefully OR fan-out to judges ───────
     # _route_after_evidence returns END (abort) or ["prosecutor","defense","tech_lead"]

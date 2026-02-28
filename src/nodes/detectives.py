@@ -45,6 +45,7 @@ from typing import Any
 from src.state import AgentState, Evidence
 from src.tools.doc_tools import DocumentAuditor
 from src.tools.repo_tools import CloneError, RepoInvestigator
+from src.tools.vision_tools import VisionInspector
 
 logger = logging.getLogger(__name__)
 
@@ -278,10 +279,82 @@ def _ingest_failure_map(
 
 
 # ---------------------------------------------------------------------------
+# VisionInspectorNode
+# ---------------------------------------------------------------------------
+
+
+def vision_inspector_node(state: AgentState) -> dict[str, Any]:
+    """Render PDF pages and classify architectural diagrams via Claude vision.
+
+    Runs as the third parallel detective branch alongside
+    ``repo_investigator_node`` and ``doc_analyst_node``.
+
+    Evaluates rubric criterion ``swarm_visual`` (target_artifact: pdf_images):
+    checks whether the report's architectural diagram accurately represents
+    the multi-agent swarm with two fan-out/fan-in patterns (Detectives and
+    Judges), or whether it shows a misleading linear pipeline.
+
+    Returns
+    -------
+    dict
+        ``{"evidences": {"swarm_visual": [Evidence]}}``
+        merged into ``AgentState.evidences`` via ``operator.ior``.
+    """
+    pdf_path: str = state["pdf_path"]
+    logger.info(
+        "[VisionInspector] Starting diagram analysis → %s",
+        pdf_path or "(no PDF provided)",
+    )
+
+    if not pdf_path or not Path(pdf_path).exists():
+        logger.warning("[VisionInspector] PDF not found at '%s'", pdf_path)
+        absent_evidence = Evidence(
+            goal="Verify architectural diagram accurately shows parallel swarm structure",
+            found=False,
+            content=None,
+            location=pdf_path or "(not specified)",
+            rationale="PDF file was not provided or does not exist at the given path.",
+            confidence=1.0,
+            criterion_id="swarm_visual",
+        )
+        return {"evidences": {"swarm_visual": [absent_evidence]}}
+
+    inspector = VisionInspector()
+    try:
+        inspector.ingest(pdf_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[VisionInspector] Ingest failed: %s", exc)
+        return {
+            "evidences": {
+                "swarm_visual": [
+                    Evidence(
+                        goal="Verify architectural diagram accurately shows parallel swarm structure",
+                        found=False,
+                        content=str(exc),
+                        location=pdf_path,
+                        rationale="PDF could not be ingested for visual analysis.",
+                        confidence=0.90,
+                        criterion_id="swarm_visual",
+                    )
+                ]
+            }
+        }
+
+    evidence = inspector.build_swarm_visual_evidence()
+    logger.info(
+        "[VisionInspector] Diagram analysis complete — found=%s confidence=%.2f",
+        evidence.found,
+        evidence.confidence,
+    )
+    return {"evidences": {"swarm_visual": [evidence]}}
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 __all__: list[str] = [
     "repo_investigator_node",
     "doc_analyst_node",
+    "vision_inspector_node",
 ]
