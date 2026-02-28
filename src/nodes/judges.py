@@ -35,6 +35,8 @@ after deserialization in case the model hallucinated either value.
 from __future__ import annotations
 
 import logging
+import os
+import re
 import time
 from typing import Any, Literal
 
@@ -53,9 +55,12 @@ logger = logging.getLogger(__name__)
 _JudgeName = Literal["Prosecutor", "Defense", "TechLead"]
 
 MAX_RETRIES: int = 3
-RETRY_DELAY_SECONDS: float = 2.0
+RETRY_DELAY_SECONDS: float = 5.0       # default delay between non-429 retries
+_RATE_LIMIT_BUFFER_SECONDS: float = 8.0  # extra buffer added on top of API retryDelay
 
-_MODEL: str = "gemini-2.0-flash"
+# Model is configurable via GEMINI_MODEL env var.
+# Default: gemini-2.5-flash (current free-tier model; 2.0/1.5 series deprecated).
+_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 _TEMPERATURE: float = 0.2  # Low temperature → consistent, reasoned judgments
 
 # ---------------------------------------------------------------------------
@@ -211,6 +216,25 @@ Return your verdict as a JudicialOpinion with these EXACT field values:
 """
 
 
+def _extract_retry_delay(exc: Exception) -> float:
+    """Parse the recommended retry delay (seconds) from a 429 error message.
+
+    The Gemini API embeds ``'retryDelay': '<N>s'`` inside the error payload.
+    We add ``_RATE_LIMIT_BUFFER_SECONDS`` on top to avoid immediate re-failure.
+    Falls back to 60 s when the pattern is not found.
+    """
+    match = re.search(r"['\"]retryDelay['\"]:\s*['\"](\d+)s['\"]", str(exc))
+    if match:
+        return float(match.group(1)) + _RATE_LIMIT_BUFFER_SECONDS
+    return 60.0
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """Return True when the exception is a 429 / RESOURCE_EXHAUSTED response."""
+    msg = str(exc)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg
+
+
 def _run_one_criterion(
     persona: str,
     criterion_id: str,
@@ -219,6 +243,10 @@ def _run_one_criterion(
     structured_llm: Any,
 ) -> JudicialOpinion | None:
     """Invoke the judge LLM for a single criterion with retry logic.
+
+    On 429 RESOURCE_EXHAUSTED the API embeds a ``retryDelay`` value; we parse
+    it and sleep for exactly that long (+ buffer) before retrying rather than
+    using the short fixed delay that guarantees re-failure.
 
     Returns
     -------
@@ -269,18 +297,34 @@ def _run_one_criterion(
                 MAX_RETRIES,
                 exc,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[%s] LLM error on criterion=%s (attempt %d/%d): %s",
-                persona,
-                criterion_id,
-                attempt,
-                MAX_RETRIES,
-                exc,
-            )
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY_SECONDS)
 
-        if attempt < MAX_RETRIES:
-            time.sleep(RETRY_DELAY_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            if _is_rate_limited(exc):
+                delay = _extract_retry_delay(exc)
+                logger.warning(
+                    "[%s] Rate-limited on criterion=%s (attempt %d/%d) — "
+                    "sleeping %.0fs as instructed by API",
+                    persona,
+                    criterion_id,
+                    attempt,
+                    MAX_RETRIES,
+                    delay,
+                )
+                if attempt < MAX_RETRIES:
+                    time.sleep(delay)
+            else:
+                logger.warning(
+                    "[%s] LLM error on criterion=%s (attempt %d/%d): %s",
+                    persona,
+                    criterion_id,
+                    attempt,
+                    MAX_RETRIES,
+                    exc,
+                )
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY_SECONDS)
 
     logger.error(
         "[%s] All %d retries exhausted for criterion=%s — opinion omitted",
